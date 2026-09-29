@@ -46,6 +46,7 @@ import { normalizeCues, parseTerms } from './lib/terms';
 import { buildLocateIndex, searchPhrases } from './lib/locate';
 import { smartWrap, type WrapOptions } from './lib/wrap';
 import { CalibratePanel } from './components/CalibratePanel';
+import { CalibStatusChip } from './components/CalibStatusChip';
 import { DedupePanel } from './components/DedupePanel';
 import { EditPanel } from './components/EditPanel';
 import { ExportPanel } from './components/ExportPanel';
@@ -103,7 +104,12 @@ export default function App() {
   );
   /** 已提交到对齐链路的 B 时间轴（null 表示使用原始 cuesB） */
   const [cuesBUsed, setCuesBUsed] = useState<Cue[] | null>(null);
-  const calibApplied = !!cuesBUsed;
+  /**
+   * 当前生效校准的锚点数快照：在“应用校准并对齐 / 确认迁移预览”提交时固化。
+   * null 表示当前对齐使用原始 B 时间。工作区顶部标识只读此快照，不读校准页
+   * 尚未提交的草稿（calibFit），因此预览计算中 / 失败 / 取消时显示保持原样。
+   */
+  const [appliedAnchorCount, setAppliedAnchorCount] = useState<number | null>(null);
 
   const [groups, setGroups] = useState<AlignGroup[] | null>(null);
   const [states, setStates] = useState<GroupState[]>([]);
@@ -169,14 +175,24 @@ export default function App() {
   const [migrateBusy, setMigrateBusy] = useState(false);
   /** 迁移预览的 Worker 错误信息（创建失败 / 计算抛错）；null 表示无错误 */
   const [migrateError, setMigrateError] = useState<string | null>(null);
-  /** 最近一次发起迁移预览的参数，用于失败后的“重新计算” */
-  const migrateLastArgs = useRef<{ b: Cue[]; calibrated: boolean } | null>(null);
+  /**
+   * 最近一次发起迁移预览时固化的参数（含发起当时草稿的启用锚点数），
+   * 用于计算中 / 失败时弹窗文案与失败后的“重新计算”。绝不回写当前工作区，
+   * 也不随校准页上之后的草稿修改而变化。
+   */
+  const [migratePending, setMigratePending] = useState<{
+    b: Cue[];
+    calibrated: boolean;
+    anchorCount: number;
+  } | null>(null);
   const [migrateData, setMigrateData] = useState<{
     oldGroups: AlignGroup[];
     oldStates: GroupState[];
     newGroups: AlignGroup[];
     newCuesB: Cue[];
     calibrated: boolean;
+    /** 发起本次预览时草稿的启用锚点数；确认提交后据此更新工作区生效标识 */
+    anchorCount: number;
     plan: MigrationPlan;
   } | null>(null);
 
@@ -234,26 +250,31 @@ export default function App() {
   const skipCalibrate = () => {
     if (cuesA.length === 0 || cuesB.length === 0) return;
     setCuesBUsed(null);
+    setAppliedAnchorCount(null);
     runAlign(cuesB);
   };
 
   const applyCalibration = () => {
     if (!calibFit.ok) return;
     if (migrateMode) {
-      previewMigration(calibFit.mappedCues, true);
+      // 只固化发起时的草稿参数生成预览，不触碰当前生效校准信息
+      previewMigration(calibFit.mappedCues, true, calibFit.active.length);
       return;
     }
-    // 提交校准后的 B 时间作为对齐输入（仅此处替换）
+    // 提交校准后的 B 时间作为对齐输入（仅此处替换），同时固化生效锚点数
     setCuesBUsed(calibFit.mappedCues);
+    setAppliedAnchorCount(calibFit.active.length);
     runAlign(calibFit.mappedCues);
   };
 
   const restoreOriginalB = () => {
     if (migrateMode) {
-      previewMigration(cuesB, false);
+      // 只固化“改用原始 B 时间”的预览参数；取消返回时生效信息仍是旧的
+      previewMigration(cuesB, false, calibFit.active.length);
       return;
     }
     setCuesBUsed(null);
+    setAppliedAnchorCount(null);
     runAlign(cuesB);
   };
 
@@ -262,6 +283,7 @@ export default function App() {
     if (!groups) return;
     setMigrateMode(true);
     setMigrateData(null);
+    setMigratePending(null);
     setMigrateError(null);
     setPhase('calibrate');
   };
@@ -278,26 +300,30 @@ export default function App() {
     setPhase('import');
   };
 
-  /** 取消迁移：终止计算、关闭预览、退出迁移校准页，旧工作区（groups/states）原封不动。 */
+  /** 取消迁移：终止计算、关闭预览、退出迁移校准页，旧工作区（groups/states/生效校准）原封不动。 */
   const cancelMigration = () => {
     taskRef.current?.stop();
     setMigrateOpen(false);
     setMigrateBusy(false);
     setMigrateError(null);
-    migrateLastArgs.current = null;
+    setMigratePending(null);
     setMigrateData(null);
     setMigrateMode(false);
     setPhase('workspace');
   };
 
-  /** 用新校准（或原始 B 时间）在 Worker 中重新对齐并计算迁移预览；不改动当前工作区。 */
-  const previewMigration = (b: Cue[], calibrated: boolean) => {
+  /**
+   * 用新校准（或原始 B 时间）在 Worker 中重新对齐并计算迁移预览；不改动当前工作区。
+   * anchorCount 为发起当时校准草稿的启用锚点数，随预览一起固化，供弹窗在计算中 /
+   * 失败时展示，并在确认提交后写入工作区生效标识。
+   */
+  const previewMigration = (b: Cue[], calibrated: boolean, anchorCount: number) => {
     if (!groups) return;
     const oldGroups = groups;
     const oldStates = states;
     const a = cuesA;
     const bOrig = cuesB;
-    migrateLastArgs.current = { b, calibrated };
+    setMigratePending({ b, calibrated, anchorCount });
     setMigrateOpen(true);
     setMigrateBusy(true);
     setMigrateError(null);
@@ -314,6 +340,7 @@ export default function App() {
             newGroups: res.newGroups,
             newCuesB: b,
             calibrated,
+            anchorCount,
             plan: res.plan,
           });
           setMigrateBusy(false);
@@ -327,21 +354,22 @@ export default function App() {
     );
   };
 
-  /** 迁移预览 Worker 失败后，用相同参数再次发起计算。 */
+  /** 迁移预览 Worker 失败后，用相同参数（同一发起快照）再次发起计算。 */
   const retryMigration = () => {
-    const args = migrateLastArgs.current;
-    if (args) previewMigration(args.b, args.calibrated);
+    const args = migratePending;
+    if (args) previewMigration(args.b, args.calibrated, args.anchorCount);
   };
 
   /** 确认预览：一次提交新对齐、迁移决定，并清空时间/消重/断行/节奏/吸附相关采纳。 */
   const confirmMigration = () => {
     const data = migrateData;
     if (!data || !data.plan.ok) return;
-    const { oldStates, newGroups, newCuesB, calibrated, plan } = data;
+    const { oldStates, newGroups, newCuesB, calibrated, anchorCount, plan } = data;
     const newBase = newGroups.map((g) => defaultStateFor(g, cuesA, newCuesB));
     const newStates = migrateStates(newGroups, newBase, oldStates, plan);
-    // 校准后的 B 时间轴随提交一起生效；使用原始时间时明确置空
+    // 校准后的 B 时间轴与锚点数快照随提交一起生效；使用原始时间时明确置空（显示未校准）
     setCuesBUsed(calibrated ? newCuesB : null);
+    setAppliedAnchorCount(calibrated ? anchorCount : null);
     setGroups(newGroups);
     setStates(newStates);
     // 时间选择一律使用新组默认值（newBase 已保证）；清空所有下游采纳
@@ -355,8 +383,8 @@ export default function App() {
     setSnapAccepted(new Set());
     setMigrateOpen(false);
     setMigrateData(null);
+    setMigratePending(null);
     setMigrateError(null);
-    migrateLastArgs.current = null;
     setMigrateMode(false);
     setAligning(false);
     setPhase('workspace');
@@ -424,6 +452,7 @@ export default function App() {
     setTextA(SAMPLE_A);
     setTextB(SAMPLE_B);
     setCuesBUsed(null);
+    setAppliedAnchorCount(null);
     setCalibDisabled(new Set());
     setCalibForced(new Set());
     setCalibOpts(DEFAULT_CALIB_OPTIONS);
@@ -433,7 +462,7 @@ export default function App() {
     setMigrateOpen(false);
     setMigrateBusy(false);
     setMigrateError(null);
-    migrateLastArgs.current = null;
+    setMigratePending(null);
     setMigrateData(null);
     setPhase('calibrate');
   };
@@ -445,6 +474,7 @@ export default function App() {
     setGroups(null);
     setStates([]);
     setCuesBUsed(null);
+    setAppliedAnchorCount(null);
     setCalibDisabled(new Set());
     setCalibForced(new Set());
     setView('groups');
@@ -456,7 +486,7 @@ export default function App() {
     setMigrateOpen(false);
     setMigrateBusy(false);
     setMigrateError(null);
-    migrateLastArgs.current = null;
+    setMigratePending(null);
     setMigrateData(null);
     setPhase('import');
   };
@@ -468,6 +498,7 @@ export default function App() {
     setGroups(null);
     setStates([]);
     setCuesBUsed(null);
+    setAppliedAnchorCount(null);
     setCalibDisabled(new Set());
     setCalibForced(new Set());
     setView('groups');
@@ -479,7 +510,7 @@ export default function App() {
     setMigrateOpen(false);
     setMigrateBusy(false);
     setMigrateError(null);
-    migrateLastArgs.current = null;
+    setMigratePending(null);
     setMigrateData(null);
     setPhase('calibrate');
   };
@@ -968,13 +999,10 @@ export default function App() {
               <span className="file-chip a">{nameA} · {cuesA.length} 条</span>
               <span className="swap">⇄</span>
               <span className="file-chip b">{nameB} · {cuesBEff.length} 条</span>
-              {calibApplied ? (
-                <span className="calib-chip on" title={`${calibFit.active.length} 个锚点 · 分段线性映射`}>
-                  ✓ 时间轴已校准（{calibFit.active.length} 锚点）
-                </span>
-              ) : (
-                <span className="calib-chip off">使用原始 B 时间</span>
-              )}
+              <CalibStatusChip
+                calibrated={appliedAnchorCount !== null}
+                anchorCount={appliedAnchorCount ?? 0}
+              />
               <span className="spacer" />
               <button
                 className="btn sm accent"
@@ -1241,10 +1269,10 @@ export default function App() {
         oldGroupCount={migrateData?.oldGroups.length ?? groups?.length ?? 0}
         newGroups={migrateData?.newGroups ?? null}
         newCuesA={cuesA}
-        newCuesB={migrateData?.newCuesB ?? cuesB}
+        newCuesB={migrateData?.newCuesB ?? migratePending?.b ?? cuesB}
         plan={migrateData?.plan ?? null}
-        calibrated={migrateData?.calibrated ?? false}
-        anchorCount={calibFit.active.length}
+        calibrated={migrateData?.calibrated ?? migratePending?.calibrated ?? false}
+        anchorCount={migrateData?.anchorCount ?? migratePending?.anchorCount ?? 0}
         onClose={cancelMigration}
         onRetry={retryMigration}
         onConfirm={confirmMigration}

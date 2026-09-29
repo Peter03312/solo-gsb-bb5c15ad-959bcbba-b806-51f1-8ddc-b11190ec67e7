@@ -51,6 +51,31 @@ describe('重新校准迁移弹窗', () => {
     );
     expect(html).toContain('重新对齐');
     expect(html).toContain('取消计算（保留旧工作区）');
+    // 计算中也按发起预览时固化的参数描述（即使调用方之后改了校准草稿，
+    // 父组件仍应传入发起时的锚点数，而不是实时草稿）
+    expect(html).toContain('按新校准（4 个锚点）');
+  });
+
+  it('计算中改用原始 B 时间的预览，说明文案显示原始 B 时间而非校准', () => {
+    const html = renderToString(
+      <RecalibrateMigrateDialog
+        open
+        busy
+        error={null}
+        oldGroupCount={0}
+        newGroups={null}
+        newCuesA={[]}
+        newCuesB={[]}
+        plan={null}
+        calibrated={false}
+        anchorCount={4}
+        onClose={noop}
+        onRetry={noop}
+        onConfirm={noop}
+      />,
+    );
+    expect(html).toContain('按原始 B 时间');
+    expect(html).not.toContain('按新校准');
   });
 
   it('Worker 失败时展示原因、提供重新计算，确认按钮禁用', () => {
@@ -75,6 +100,8 @@ describe('重新校准迁移弹窗', () => {
     expect(html).toContain('worker crashed');
     expect(html).toContain('旧工作区保持原样');
     expect(html).toContain('重新计算');
+    // 失败时说明文案仍按发起时固化的校准参数展示，不随后续草稿变化
+    expect(html).toContain('按新校准（4 个锚点）');
     expect(html).toMatch(/<button[^>]*disabled[^>]*>\s*确认并一次提交/);
   });
 
