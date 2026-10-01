@@ -45,6 +45,7 @@ import {
 import { normalizeCues, parseTerms } from './lib/terms';
 import { buildLocateIndex, searchPhrases } from './lib/locate';
 import { smartWrap, type WrapOptions } from './lib/wrap';
+import { CalibStatusChip } from './components/CalibStatusChip';
 import { CalibratePanel } from './components/CalibratePanel';
 import { DedupePanel } from './components/DedupePanel';
 import { EditPanel } from './components/EditPanel';
@@ -101,9 +102,13 @@ export default function App() {
     () => fitCalibration(cuesA, cuesB, calibAnchors, calibDisabled, calibForced),
     [cuesA, cuesB, calibAnchors, calibDisabled, calibForced],
   );
-  /** 已提交到对齐链路的 B 时间轴（null 表示使用原始 cuesB） */
-  const [cuesBUsed, setCuesBUsed] = useState<Cue[] | null>(null);
-  const calibApplied = !!cuesBUsed;
+  /**
+   * 已提交到对齐链路的 B 时间轴及其校准信息快照（null 表示使用原始 cuesB）。
+   * 仅在「应用校准 / 恢复原始 B 时间 / 确认迁移预览」时更新；校准页里的草稿调整
+   * （锚点勾选、筛选参数）与未确认的迁移预览都不会触碰它，因此工作区顶部的
+   * 已校准标识、锚点数始终与实际生效的 B 时间轴一致。
+   */
+  const [appliedB, setAppliedB] = useState<{ cues: Cue[]; anchors: number } | null>(null);
 
   const [groups, setGroups] = useState<AlignGroup[] | null>(null);
   const [states, setStates] = useState<GroupState[]>([]);
@@ -115,7 +120,7 @@ export default function App() {
   const [autoFix, setAutoFix] = useState(false);
 
   /** 当前对齐链路实际使用的 B：已校准提交时为校准后的时间轴，否则为原始 B。 */
-  const cuesBEff: Cue[] = groups ? (cuesBUsed ?? cuesB) : cuesB;
+  const cuesBEff: Cue[] = groups ? (appliedB?.cues ?? cuesB) : cuesB;
 
   // 智能断行：视图切换、参数与逐条应用状态（key 为 groupIndex）
   const [view, setView] = useState<
@@ -170,13 +175,15 @@ export default function App() {
   /** 迁移预览的 Worker 错误信息（创建失败 / 计算抛错）；null 表示无错误 */
   const [migrateError, setMigrateError] = useState<string | null>(null);
   /** 最近一次发起迁移预览的参数，用于失败后的“重新计算” */
-  const migrateLastArgs = useRef<{ b: Cue[]; calibrated: boolean } | null>(null);
+  const migrateLastArgs = useRef<{ b: Cue[]; calibrated: boolean; anchors: number } | null>(null);
   const [migrateData, setMigrateData] = useState<{
     oldGroups: AlignGroup[];
     oldStates: GroupState[];
     newGroups: AlignGroup[];
     newCuesB: Cue[];
     calibrated: boolean;
+    /** 本次预览所用新校准的启用锚点数（未校准为 0）；确认提交时随新 B 时间轴一起生效 */
+    anchors: number;
     plan: MigrationPlan;
   } | null>(null);
 
@@ -233,27 +240,27 @@ export default function App() {
 
   const skipCalibrate = () => {
     if (cuesA.length === 0 || cuesB.length === 0) return;
-    setCuesBUsed(null);
+    setAppliedB(null);
     runAlign(cuesB);
   };
 
   const applyCalibration = () => {
     if (!calibFit.ok) return;
     if (migrateMode) {
-      previewMigration(calibFit.mappedCues, true);
+      previewMigration(calibFit.mappedCues, true, calibFit.active.length);
       return;
     }
-    // 提交校准后的 B 时间作为对齐输入（仅此处替换）
-    setCuesBUsed(calibFit.mappedCues);
+    // 提交校准后的 B 时间作为对齐输入（仅此处替换），并快照启用锚点数供工作区展示
+    setAppliedB({ cues: calibFit.mappedCues, anchors: calibFit.active.length });
     runAlign(calibFit.mappedCues);
   };
 
   const restoreOriginalB = () => {
     if (migrateMode) {
-      previewMigration(cuesB, false);
+      previewMigration(cuesB, false, 0);
       return;
     }
-    setCuesBUsed(null);
+    setAppliedB(null);
     runAlign(cuesB);
   };
 
@@ -291,13 +298,13 @@ export default function App() {
   };
 
   /** 用新校准（或原始 B 时间）在 Worker 中重新对齐并计算迁移预览；不改动当前工作区。 */
-  const previewMigration = (b: Cue[], calibrated: boolean) => {
+  const previewMigration = (b: Cue[], calibrated: boolean, anchors: number) => {
     if (!groups) return;
     const oldGroups = groups;
     const oldStates = states;
     const a = cuesA;
     const bOrig = cuesB;
-    migrateLastArgs.current = { b, calibrated };
+    migrateLastArgs.current = { b, calibrated, anchors };
     setMigrateOpen(true);
     setMigrateBusy(true);
     setMigrateError(null);
@@ -314,6 +321,7 @@ export default function App() {
             newGroups: res.newGroups,
             newCuesB: b,
             calibrated,
+            anchors,
             plan: res.plan,
           });
           setMigrateBusy(false);
@@ -330,18 +338,18 @@ export default function App() {
   /** 迁移预览 Worker 失败后，用相同参数再次发起计算。 */
   const retryMigration = () => {
     const args = migrateLastArgs.current;
-    if (args) previewMigration(args.b, args.calibrated);
+    if (args) previewMigration(args.b, args.calibrated, args.anchors);
   };
 
   /** 确认预览：一次提交新对齐、迁移决定，并清空时间/消重/断行/节奏/吸附相关采纳。 */
   const confirmMigration = () => {
     const data = migrateData;
     if (!data || !data.plan.ok) return;
-    const { oldStates, newGroups, newCuesB, calibrated, plan } = data;
+    const { oldStates, newGroups, newCuesB, calibrated, anchors, plan } = data;
     const newBase = newGroups.map((g) => defaultStateFor(g, cuesA, newCuesB));
     const newStates = migrateStates(newGroups, newBase, oldStates, plan);
-    // 校准后的 B 时间轴随提交一起生效；使用原始时间时明确置空
-    setCuesBUsed(calibrated ? newCuesB : null);
+    // 校准后的 B 时间轴随提交一起生效（含启用锚点数快照）；使用原始时间时明确置空
+    setAppliedB(calibrated ? { cues: newCuesB, anchors } : null);
     setGroups(newGroups);
     setStates(newStates);
     // 时间选择一律使用新组默认值（newBase 已保证）；清空所有下游采纳
@@ -423,7 +431,7 @@ export default function App() {
     setNameB('示例B.srt');
     setTextA(SAMPLE_A);
     setTextB(SAMPLE_B);
-    setCuesBUsed(null);
+    setAppliedB(null);
     setCalibDisabled(new Set());
     setCalibForced(new Set());
     setCalibOpts(DEFAULT_CALIB_OPTIONS);
@@ -444,7 +452,7 @@ export default function App() {
     setAlignError(null);
     setGroups(null);
     setStates([]);
-    setCuesBUsed(null);
+    setAppliedB(null);
     setCalibDisabled(new Set());
     setCalibForced(new Set());
     setView('groups');
@@ -467,7 +475,7 @@ export default function App() {
     setAlignError(null);
     setGroups(null);
     setStates([]);
-    setCuesBUsed(null);
+    setAppliedB(null);
     setCalibDisabled(new Set());
     setCalibForced(new Set());
     setView('groups');
@@ -968,13 +976,8 @@ export default function App() {
               <span className="file-chip a">{nameA} · {cuesA.length} 条</span>
               <span className="swap">⇄</span>
               <span className="file-chip b">{nameB} · {cuesBEff.length} 条</span>
-              {calibApplied ? (
-                <span className="calib-chip on" title={`${calibFit.active.length} 个锚点 · 分段线性映射`}>
-                  ✓ 时间轴已校准（{calibFit.active.length} 锚点）
-                </span>
-              ) : (
-                <span className="calib-chip off">使用原始 B 时间</span>
-              )}
+              {/* 只展示已提交校准的快照；校准页草稿与未确认的迁移预览不影响此处 */}
+              <CalibStatusChip applied={appliedB} />
               <span className="spacer" />
               <button
                 className="btn sm accent"
